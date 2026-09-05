@@ -1,0 +1,157 @@
+"""Tests for AttachmentsRepository against a real Postgres instance."""
+
+from __future__ import annotations
+
+
+from application.storage.db.repositories.attachments import AttachmentsRepository
+
+
+def _repo(conn) -> AttachmentsRepository:
+    return AttachmentsRepository(conn)
+
+
+class TestCreate:
+    def test_creates_attachment(self, pg_conn):
+        repo = _repo(pg_conn)
+        doc = repo.create("user-1", "file.pdf", "/uploads/file.pdf")
+        assert doc["user_id"] == "user-1"
+        assert doc["filename"] == "file.pdf"
+        assert doc["upload_path"] == "/uploads/file.pdf"
+        assert doc["id"] is not None
+
+    def test_creates_with_optional_fields(self, pg_conn):
+        repo = _repo(pg_conn)
+        doc = repo.create("user-1", "img.png", "/uploads/img.png",
+                          mime_type="image/png", size=1024)
+        assert doc["mime_type"] == "image/png"
+        assert doc["size"] == 1024
+
+    def test_create_returns_id_and_underscore_id(self, pg_conn):
+        repo = _repo(pg_conn)
+        doc = repo.create("u", "f", "/p")
+        assert doc["_id"] == doc["id"]
+
+    def test_create_aliases_upload_path_as_path(self, pg_conn):
+        # LLM provider code (google_ai/openai/anthropic and handlers/base)
+        # reads attachment.get("path") — preserved from the legacy Mongo
+        # shape. Repo emits both keys so consumers don't need to know
+        # which storage backend produced the dict.
+        repo = _repo(pg_conn)
+        doc = repo.create("u", "f", "/uploads/x.png")
+        assert doc["path"] == "/uploads/x.png"
+        assert doc["upload_path"] == "/uploads/x.png"
+
+    def test_get_aliases_upload_path_as_path(self, pg_conn):
+        repo = _repo(pg_conn)
+        created = repo.create("u", "f", "/uploads/y.pdf")
+        fetched = repo.get(created["id"], "u")
+        assert fetched is not None
+        assert fetched["path"] == "/uploads/y.pdf"
+
+    def test_create_with_legacy_mongo_id(self, pg_conn):
+        repo = _repo(pg_conn)
+        doc = repo.create(
+            "u",
+            "f",
+            "/p",
+            legacy_mongo_id="507f1f77bcf86cd799439011",
+        )
+        assert doc["legacy_mongo_id"] == "507f1f77bcf86cd799439011"
+
+    def test_create_strips_null_bytes_from_content_and_metadata(self, pg_conn):
+        # A parsed document with embedded NULs (mislabeled binary) must
+        # not kill the INSERT — Postgres rejects \x00 in text and jsonb.
+        repo = _repo(pg_conn)
+        doc = repo.create(
+            "u",
+            "weird.pdf",
+            "/uploads/weird.pdf",
+            content="parsed\x00text\x00here",
+            metadata={"transcript_lang\x00": "en\x00"},
+        )
+        assert doc["content"] == "parsedtexthere"
+        assert doc["metadata"] == {"transcript_lang": "en"}
+
+
+class TestGet:
+    def test_get_existing(self, pg_conn):
+        repo = _repo(pg_conn)
+        created = repo.create("u", "f", "/p")
+        fetched = repo.get(created["id"], "u")
+        assert fetched["id"] == created["id"]
+
+    def test_get_nonexistent_returns_none(self, pg_conn):
+        repo = _repo(pg_conn)
+        assert repo.get("00000000-0000-0000-0000-000000000000", "u") is None
+
+    def test_get_wrong_user_returns_none(self, pg_conn):
+        repo = _repo(pg_conn)
+        created = repo.create("u", "f", "/p")
+        assert repo.get(created["id"], "other") is None
+
+    def test_get_by_legacy_id(self, pg_conn):
+        repo = _repo(pg_conn)
+        created = repo.create(
+            "u",
+            "f",
+            "/p",
+            legacy_mongo_id="507f1f77bcf86cd799439011",
+        )
+        fetched = repo.get_by_legacy_id("507f1f77bcf86cd799439011", "u")
+        assert fetched["id"] == created["id"]
+
+
+class TestListForUser:
+    def test_lists_only_own_attachments(self, pg_conn):
+        repo = _repo(pg_conn)
+        repo.create("alice", "a1.pdf", "/a1")
+        repo.create("alice", "a2.pdf", "/a2")
+        repo.create("bob", "b1.pdf", "/b1")
+        results = repo.list_for_user("alice")
+        assert len(results) == 2
+        assert all(r["user_id"] == "alice" for r in results)
+
+    def test_list_empty_for_unknown_user(self, pg_conn):
+        repo = _repo(pg_conn)
+        results = repo.list_for_user("nonexistent")
+        assert results == []
+
+
+class TestUpdateMetadataIfContentNull:
+    """Atomic no-clobber write for failure provenance: the ``content IS
+    NULL`` predicate lives in the UPDATE itself, so a success row committed
+    by a concurrent duplicate execution can never be overwritten between a
+    check and the write."""
+
+    def test_updates_row_without_stored_content(self, pg_conn):
+        repo = _repo(pg_conn)
+        repo.create("u", "f.xlsx", "/p", content=None,
+                    metadata={"extraction": {"status": "failed", "error": "first"}},
+                    legacy_mongo_id="handle-1")
+
+        updated = repo.update_metadata_if_content_null(
+            "handle-1", "u", {"extraction": {"status": "failed", "error": "second"}}
+        )
+
+        assert updated is True
+        row = repo.get_by_legacy_id("handle-1", "u")
+        assert row["metadata"]["extraction"]["error"] == "second"
+
+    def test_refuses_row_with_stored_content(self, pg_conn):
+        repo = _repo(pg_conn)
+        repo.create("u", "f.txt", "/p", content="durable text", token_count=2,
+                    metadata={"extraction": {"status": "ok"}},
+                    legacy_mongo_id="handle-2")
+
+        updated = repo.update_metadata_if_content_null(
+            "handle-2", "u", {"extraction": {"status": "failed", "error": "late loser"}}
+        )
+
+        assert updated is False
+        row = repo.get_by_legacy_id("handle-2", "u")
+        assert row["metadata"]["extraction"]["status"] == "ok"
+        assert row["content"] == "durable text"
+
+    def test_missing_row_returns_false(self, pg_conn):
+        repo = _repo(pg_conn)
+        assert repo.update_metadata_if_content_null("nope", "u", {"x": 1}) is False
