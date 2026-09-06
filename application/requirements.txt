@@ -1,5 +1,5 @@
 a2wsgi==1.10.10
-alembic>=1.13,<2
+alembic>=1.19.1,<2
 anthropic==0.121.0
 asgiref>=3.11.1
 boto3==1.43.67
