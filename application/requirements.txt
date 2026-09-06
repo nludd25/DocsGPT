@@ -122,4 +122,4 @@ markdownify==1.2.3
 tldextract==5.3.2
 # google-genai caps websockets <17.0; 17.x will not resolve.
 websockets==16.0
-websocket-client==1.9.0
+websocket-client==1.9.2
