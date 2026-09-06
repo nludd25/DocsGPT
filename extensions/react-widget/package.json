@@ -52,7 +52,7 @@
     "clsx": "^2.1.0",
     "dompurify": "^3.1.5",
     "flow-bin": "^0.326.0",
-    "markdown-it": "^14.1.0",
+    "markdown-it": "^15.0.1",
     "react": "^19.2.5",
     "react-dom": "^19.2.5",
     "styled-components": "^6.1.8"
